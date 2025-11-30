@@ -9,62 +9,57 @@
     const ctx = canvas.getContext('2d');
     const ws = new WebSocket(`ws://${location.host}`);
 
-    let stateBuffer = [];               // Stores last N snapshots
+    let stateBuffer = [];
 
-    // IMPORTANT: This must be >= network latency used by the server.
-    // Server used LATENCY = 200ms. Use a slightly larger buffer to be safe.
-    const RENDER_DELAY = 300;           // Render 300ms in the past
-
-    // Debug helpers (remove or comment out later)
-    function dbg(...args) { console.log('[DBG]', ...args); }
-
-    // Receive state updates with timestamps
-    ws.onopen = () => dbg('WebSocket OPEN');
-    ws.onclose = () => dbg('WebSocket CLOSED');
-    ws.onerror = (e) => dbg('WebSocket ERROR', e);
+    // Must be > artificial latency, safer = 400ms
+    const RENDER_DELAY = 400;
 
     ws.onmessage = (e) => {
-      try {
-        const msg = JSON.parse(e.data);
+      const msg = JSON.parse(e.data);
 
-        // Debug incoming messages
-        // dbg('IN:', msg.type, 'ts:', msg.timestamp);
+      if (msg.type === "state") {
+        stateBuffer.push(msg);
 
-        if (msg.type === 'state') {
-          // push snapshot (we keep as-is)
-          stateBuffer.push(msg);
-
-          // Keep buffer size reasonable
-          if (stateBuffer.length > 60) stateBuffer.shift();
-        }
-
-        // Optional: inspect init messages
-        if (msg.type === 'init') {
-          dbg('Received init:', msg);
-        }
-      } catch (err) {
-        dbg('Failed to parse message', err, e.data);
+        // Make buffer long enough so timestamps never outrun
+        if (stateBuffer.length > 200) stateBuffer.shift();
       }
     };
 
-    // Send movement
     function sendMove(dx, dy) {
       if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'move', dx, dy }));
+        ws.send(JSON.stringify({ type: "move", dx, dy }));
       }
     }
 
-    // Arrow-key input
-    window.addEventListener('keydown', (e) => {
+    window.addEventListener("keydown", (e) => {
       if (e.key === "ArrowUp") sendMove(0, -1);
       if (e.key === "ArrowDown") sendMove(0, 1);
       if (e.key === "ArrowLeft") sendMove(-1, 0);
       if (e.key === "ArrowRight") sendMove(1, 0);
     });
 
-    // Lerp helper (linear interpolation)
     function lerp(a, b, t) {
       return a + (b - a) * t;
+    }
+
+    function renderFallback(latest) {
+      // Draw coins
+      ctx.fillStyle = "gold";
+      latest.coins.forEach((c) => {
+        ctx.beginPath();
+        ctx.arc(c.x, c.y, 10, 0, Math.PI * 2);
+        ctx.fill();
+      });
+
+      // Draw players
+      for (let id in latest.players) {
+        let p = latest.players[id];
+        ctx.fillStyle = p.color;
+        ctx.fillRect(p.x, p.y, 20, 20);
+
+        ctx.fillStyle = "white";
+        ctx.fillText(`Score: ${p.score}`, p.x - 5, p.y - 10);
+      }
     }
 
     function render() {
@@ -73,60 +68,54 @@
       const now = Date.now();
       const renderTime = now - RENDER_DELAY;
 
-      // Debug buffer size occasionally
-      if (Math.random() < 0.01) {
-        dbg('bufferLen', stateBuffer.length, 'renderTime', renderTime);
-      }
-
-      // Find two snapshots around renderTime
       let t0 = null, t1 = null;
+
       for (let i = 0; i < stateBuffer.length - 1; i++) {
         if (
           stateBuffer[i].timestamp <= renderTime &&
-          stateBuffer[i+1].timestamp >= renderTime
+          stateBuffer[i + 1].timestamp >= renderTime
         ) {
           t0 = stateBuffer[i];
-          t1 = stateBuffer[i+1];
+          t1 = stateBuffer[i + 1];
           break;
         }
       }
 
-      if (t0 && t1) {
-        const total = t1.timestamp - t0.timestamp;
-        const current = renderTime - t0.timestamp;
-        const alpha = total > 0 ? (current / total) : 0; // guard divide by zero
-
-        // Draw interpolated players
-        for (let id in t1.players) {
-          const p1 = t1.players[id];  // new snapshot
-          const p0 = t0.players[id];  // old snapshot
-
-          // If player didn't exist previously, skip interpolation (we could just draw p1)
-          if (!p0) {
-            // fallback: draw at current position
-            ctx.fillStyle = p1.color || 'white';
-            ctx.fillRect(p1.x, p1.y, 20, 20);
-            continue;
-          }
-
-          const x = lerp(p0.x, p1.x, alpha);
-          const y = lerp(p0.y, p1.y, alpha);
-
-          ctx.fillStyle = p1.color || 'white';
-          ctx.fillRect(x, y, 20, 20);
-        }
-      } else {
-        // If we don't have a valid pair yet, optionally draw the latest known snapshot (fallback)
+      if (!t0 || !t1) {
+        // fallback: draw newest snapshot safely
         if (stateBuffer.length > 0) {
-          const last = stateBuffer[stateBuffer.length - 1];
-          if (last && last.players) {
-            for (let id in last.players) {
-              const p = last.players[id];
-              ctx.fillStyle = p.color || 'white';
-              ctx.fillRect(p.x, p.y, 20, 20);
-            }
-          }
+          renderFallback(stateBuffer[stateBuffer.length - 1]);
         }
+        requestAnimationFrame(render);
+        return;
+      }
+
+      const alpha =
+        (renderTime - t0.timestamp) / (t1.timestamp - t0.timestamp);
+
+      // --- draw coins from t1 (they do not move) ---
+      ctx.fillStyle = "gold";
+      t1.coins.forEach((c) => {
+        ctx.beginPath();
+        ctx.arc(c.x, c.y, 10, 0, Math.PI * 2);
+        ctx.fill();
+      });
+
+      // --- draw interpolated players ---
+      for (let id in t1.players) {
+        let p1 = t1.players[id];
+        let p0 = t0.players[id];
+
+        if (!p0) continue;
+
+        const x = lerp(p0.x, p1.x, alpha);
+        const y = lerp(p0.y, p1.y, alpha);
+
+        ctx.fillStyle = p1.color;
+        ctx.fillRect(x, y, 20, 20);
+
+        ctx.fillStyle = "white";
+        ctx.fillText(`Score: ${p1.score}`, x - 5, y - 10);
       }
 
       requestAnimationFrame(render);
