@@ -1,127 +1,272 @@
 <!DOCTYPE html>
 <html>
-<body style="background:#333; display:flex; justify-content:center;">
-  <canvas id="game" width="600" height="600"
-    style="background:#000; border:2px solid #555; margin-top:20px;"></canvas>
+<head>
+  <meta charset="utf-8" />
+  <title>Coin Collector (Advanced)</title>
+  <style>
+    body { background:#333; font-family: sans-serif; margin:0; }
+    #wrap { display:flex; justify-content:center; padding:12px; }
+    canvas#game { background:#000; border:2px solid #555; }
+    #debug {
+      position: fixed; left: 10px; top: 10px; color: #0f0; background: rgba(0,0,0,0.6);
+      padding:8px; font-size:12px; border-radius:6px; z-index:100;
+    }
+    #timeline { position: fixed; right: 10px; top: 10px; background: rgba(255,255,255,0.03);
+      border:1px solid rgba(255,255,255,0.06); padding:6px; }
+  </style>
+</head>
+<body>
+  <div id="debug">Connecting...</div>
+  <div id="timeline"><canvas id="tl" width="300" height="80"></canvas></div>
+  <div id="wrap"><canvas id="game" width="600" height="600"></canvas></div>
 
   <script>
     const canvas = document.getElementById('game');
     const ctx = canvas.getContext('2d');
+
+    const tlCanvas = document.getElementById('tl');
+    const tl = tlCanvas.getContext('2d');
+
+    const debug = document.getElementById('debug');
+
     const ws = new WebSocket(`ws://${location.host}`);
 
-    let stateBuffer = [];
+    // Prediction & reconciliation state
+    let myId = null;
+    let inputSeq = 0;
+    let pendingInputs = []; // {seq, dx, dy}
+    const local = { x:300, y:300 }; // predicted local position
 
-    // Must be > artificial latency, safer = 400ms
+    // Interpolation buffer for remote players
+    let stateBuffer = [];
     const RENDER_DELAY = 400;
+    const MAX_BUF = 200;
+
+    // Stats
+    let lastPingSent = 0;
+    let rtt = 0;
+    let packetsReceived = 0;
+    let packetsDroppedEstimate = 0;
+    let lastSnapshotTime = 0;
+
+    // helpers
+    function lerp(a,b,t){return a + (b-a)*t;}
+    function now(){return Date.now();}
+
+    ws.onopen = () => {
+      debug.innerText = 'Connected. Waiting for init...';
+      // start ping loop
+      setInterval(()=> {
+        lastPingSent = now();
+        ws.send(JSON.stringify({ type:'ping', clientSent: lastPingSent }));
+      }, 2000);
+    };
 
     ws.onmessage = (e) => {
-      const msg = JSON.parse(e.data);
+      // try parse
+      let msg;
+      try { msg = JSON.parse(e.data); } catch(e){ return; }
 
-      if (msg.type === "state") {
+      // pong: measure RTT
+      if (msg.type === 'pong') {
+        rtt = now() - msg.clientSent;
+        return;
+      }
+
+      // init contains my id
+      if (msg.type === 'init') {
+        myId = msg.selfId;
+        debug.innerText = 'Got init. MyId: ' + myId;
+        return;
+      }
+
+      if (msg.type === 'state') {
+        packetsReceived++;
+        lastSnapshotTime = msg.timestamp;
         stateBuffer.push(msg);
+        if (stateBuffer.length > MAX_BUF) stateBuffer.shift();
 
-        // Make buffer long enough so timestamps never outrun
-        if (stateBuffer.length > 200) stateBuffer.shift();
+        // If server gave authoritative position for me, reconcile:
+        if (myId && msg.players && msg.players[myId]) {
+          const serverPlayer = msg.players[myId];
+          const serverSeq = serverPlayer.lastSeq || 0;
+
+          // Step 1: set local position to server authoritative pos
+          local.x = serverPlayer.x;
+          local.y = serverPlayer.y;
+
+          // Step 2: drop inputs <= serverSeq, reapply remaining pending inputs
+          const remaining = [];
+          for (const inp of pendingInputs) {
+            if (inp.seq > serverSeq) {
+              // reapply to local predicted position
+              local.x += inp.dx * 5;
+              local.y += inp.dy * 5;
+              remaining.push(inp);
+            }
+          }
+          pendingInputs = remaining;
+        }
       }
     };
 
-    function sendMove(dx, dy) {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "move", dx, dy }));
-      }
+    ws.onclose = () => debug.innerText = 'Disconnected';
+
+    // Input: send as "input" messages with seq number; apply locally immediately (prediction)
+    function sendInput(dx, dy) {
+      inputSeq++;
+      const msg = { type:'input', seq: inputSeq, dx, dy };
+      // add to pending inputs
+      pendingInputs.push(msg);
+      // local prediction
+      local.x += dx * 5;
+      local.y += dy * 5;
+      // clamp
+      local.x = Math.max(0, Math.min(580, local.x));
+      local.y = Math.max(0, Math.min(580, local.y));
+      // send
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
     }
 
-    window.addEventListener("keydown", (e) => {
-      if (e.key === "ArrowUp") sendMove(0, -1);
-      if (e.key === "ArrowDown") sendMove(0, 1);
-      if (e.key === "ArrowLeft") sendMove(-1, 0);
-      if (e.key === "ArrowRight") sendMove(1, 0);
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowUp') sendInput(0, -1);
+      if (e.key === 'ArrowDown') sendInput(0, 1);
+      if (e.key === 'ArrowLeft') sendInput(-1, 0);
+      if (e.key === 'ArrowRight') sendInput(1, 0);
     });
 
-    function lerp(a, b, t) {
-      return a + (b - a) * t;
-    }
+    // Draw timeline graph of snapshots and render pointer
+    function drawTimeline() {
+      const w = tlCanvas.width;
+      const h = tlCanvas.height;
+      tl.clearRect(0,0,w,h);
+      tl.fillStyle = '#111';
+      tl.fillRect(0,0,w,h);
 
-    function renderFallback(latest) {
-      // Draw coins
-      ctx.fillStyle = "gold";
-      latest.coins.forEach((c) => {
-        ctx.beginPath();
-        ctx.arc(c.x, c.y, 10, 0, Math.PI * 2);
-        ctx.fill();
-      });
-
-      // Draw players
-      for (let id in latest.players) {
-        let p = latest.players[id];
-        ctx.fillStyle = p.color;
-        ctx.fillRect(p.x, p.y, 20, 20);
-
-        ctx.fillStyle = "white";
-        ctx.fillText(`Score: ${p.score}`, p.x - 5, p.y - 10);
+      // draw snapshots as bars relative to now
+      const snapshots = stateBuffer.slice(-100);
+      const cur = now();
+      // horizontal window: last 2000 ms
+      const windowMs = 2000;
+      for (let i = 0; i < snapshots.length; i++) {
+        const s = snapshots[i];
+        const age = cur - s.timestamp; // ms
+        const x = w - (age / windowMs) * w;
+        if (x < 0 || x > w) continue;
+        const hbar = 20;
+        tl.fillStyle = '#6cf';
+        tl.fillRect(x, h - hbar, 2, hbar);
       }
+      // renderTime pointer
+      const renderTime = cur - RENDER_DELAY;
+      const ageRT = cur - renderTime;
+      const xRT = w - (ageRT / windowMs) * w;
+      tl.fillStyle = '#f66';
+      tl.fillRect(xRT, 0, 2, h);
+
+      // draw text
+      tl.fillStyle = '#fff';
+      tl.font = '10px monospace';
+      tl.fillText('Snapshot timeline (now→left)  window:' + windowMs + 'ms', 4, 10);
     }
 
+    // draw debug overlay
+    function drawDebug() {
+      const bufLen = stateBuffer.length;
+      const pending = pendingInputs.length;
+      const lossEstimate = Math.max(0, Math.round(((inputSeq - packetsReceived) / (inputSeq || 1)) * 100));
+      debug.innerHTML = `
+        <b>Ping/RTT:</b> ${rtt} ms<br/>
+        <b>Buffer:</b> ${bufLen} snaps<br/>
+        <b>Pending inputs:</b> ${pending}<br/>
+        <b>Packets recv:</b> ${packetsReceived}<br/>
+        <b>Loss est:</b> ${lossEstimate}%<br/>
+        <b>Local pos:</b> ${Math.round(local.x)},${Math.round(local.y)}<br/>
+      `;
+    }
+
+    // Rendering loop
     function render() {
-      ctx.clearRect(0, 0, 600, 600);
+      ctx.clearRect(0,0,600,600);
 
-      const now = Date.now();
-      const renderTime = now - RENDER_DELAY;
+      const cur = now();
+      const renderTime = cur - RENDER_DELAY;
 
+      // find t0,t1
       let t0 = null, t1 = null;
-
       for (let i = 0; i < stateBuffer.length - 1; i++) {
-        if (
-          stateBuffer[i].timestamp <= renderTime &&
-          stateBuffer[i + 1].timestamp >= renderTime
-        ) {
+        if (stateBuffer[i].timestamp <= renderTime && stateBuffer[i+1].timestamp >= renderTime) {
           t0 = stateBuffer[i];
-          t1 = stateBuffer[i + 1];
+          t1 = stateBuffer[i+1];
           break;
         }
       }
 
-      if (!t0 || !t1) {
-        // fallback: draw newest snapshot safely
-        if (stateBuffer.length > 0) {
-          renderFallback(stateBuffer[stateBuffer.length - 1]);
+      // draw coins and players
+      if (t0 && t1) {
+        const total = t1.timestamp - t0.timestamp;
+        const alpha = total > 0 ? (renderTime - t0.timestamp) / total : 0;
+
+        // coins: draw from t1 (non-moving)
+        ctx.fillStyle = 'gold';
+        t1.coins.forEach(c => {
+          ctx.beginPath();
+          ctx.arc(c.x, c.y, 10, 0, Math.PI*2);
+          ctx.fill();
+        });
+
+        // players: interpolate
+        for (const id in t1.players) {
+          const p1 = t1.players[id];
+          const p0 = t0.players[id];
+          if (!p0) { // new player - draw at p1
+            ctx.fillStyle = p1.color;
+            ctx.fillRect(p1.x, p1.y, 20, 20);
+            continue;
+          }
+          const x = lerp(p0.x, p1.x, alpha);
+          const y = lerp(p0.y, p1.y, alpha);
+
+          ctx.fillStyle = p1.color;
+          ctx.fillRect(x, y, 20, 20);
+
+          ctx.fillStyle = 'white';
+          ctx.fillText(`S:${p1.score}`, x - 6, y - 10);
         }
-        requestAnimationFrame(render);
-        return;
+      } else {
+        // fallback: draw latest snapshot if exists
+        if (stateBuffer.length > 0) {
+          const latest = stateBuffer[stateBuffer.length - 1];
+          ctx.fillStyle = 'gold';
+          latest.coins.forEach(c => {
+            ctx.beginPath();
+            ctx.arc(c.x, c.y, 10, 0, Math.PI*2);
+            ctx.fill();
+          });
+          for (const id in latest.players) {
+            const p = latest.players[id];
+            ctx.fillStyle = p.color;
+            ctx.fillRect(p.x, p.y, 20, 20);
+            ctx.fillStyle = 'white';
+            ctx.fillText(`S:${p.score}`, p.x - 6, p.y - 10);
+          }
+        }
       }
 
-      const alpha =
-        (renderTime - t0.timestamp) / (t1.timestamp - t0.timestamp);
+      // Draw predicted local player on top (instant)
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(local.x - 1, local.y - 1, 22, 22);
 
-      // --- draw coins from t1 (they do not move) ---
-      ctx.fillStyle = "gold";
-      t1.coins.forEach((c) => {
-        ctx.beginPath();
-        ctx.arc(c.x, c.y, 10, 0, Math.PI * 2);
-        ctx.fill();
-      });
-
-      // --- draw interpolated players ---
-      for (let id in t1.players) {
-        let p1 = t1.players[id];
-        let p0 = t0.players[id];
-
-        if (!p0) continue;
-
-        const x = lerp(p0.x, p1.x, alpha);
-        const y = lerp(p0.y, p1.y, alpha);
-
-        ctx.fillStyle = p1.color;
-        ctx.fillRect(x, y, 20, 20);
-
-        ctx.fillStyle = "white";
-        ctx.fillText(`Score: ${p1.score}`, x - 5, y - 10);
-      }
+      // debug + timeline
+      drawDebug();
+      drawTimeline();
 
       requestAnimationFrame(render);
     }
 
     render();
+
   </script>
 </body>
 </html>

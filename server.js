@@ -1,3 +1,4 @@
+// server.js
 const express = require('express');
 const WebSocket = require('ws');
 const { v4: uuidv4 } = require('uuid');
@@ -12,7 +13,9 @@ const wss = new WebSocket.Server({ server });
 
 let players = {};
 let coins = [];
+
 const LATENCY = 200; // ms artificial delay
+const PACKET_LOSS = 0.05; // 5% packet loss
 
 // Spawn coins randomly
 function spawnCoin() {
@@ -23,10 +26,16 @@ function spawnCoin() {
   });
 }
 
-// Spawn 10 coins initially
+// initial coins
 for (let i = 0; i < 10; i++) spawnCoin();
 
+function withPacketLoss() {
+  return Math.random() < PACKET_LOSS;
+}
+
 function sendWithLag(ws, data) {
+  // simulate downstream packet loss
+  if (withPacketLoss()) return; // drop outgoing packet
   setTimeout(() => {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(data));
@@ -41,23 +50,45 @@ wss.on('connection', (ws) => {
     id,
     x: 300,
     y: 300,
-    color: 'blue',
+    color: 'hsl(' + Math.floor(Math.random() * 360) + ',70%,50%)',
     score: 0,
+    lastSeq: 0, // last input seq processed from this client
   };
 
+  // send init
   sendWithLag(ws, { type: 'init', selfId: id });
 
-  ws.on('message', (msg) => {
+  ws.on('message', (raw) => {
+    // simulate upstream packet loss
+    if (withPacketLoss()) return;
+    // simulate upstream latency
     setTimeout(() => {
-      const data = JSON.parse(msg);
+      try {
+        const msg = JSON.parse(raw);
 
-      if (data.type === 'move' && players[id]) {
-        players[id].x += data.dx * 5;
-        players[id].y += data.dy * 5;
+        // ping-pong for RTT measurement
+        if (msg.type === 'ping') {
+          // echo back pong (will be delayed by sendWithLag)
+          sendWithLag(ws, { type: 'pong', clientSent: msg.clientSent });
+          return;
+        }
 
-        // clamp bounds
-        players[id].x = Math.max(0, Math.min(580, players[id].x));
-        players[id].y = Math.max(0, Math.min(580, players[id].y));
+        // input messages: client prediction inputs
+        if (msg.type === 'input') {
+          // msg: {type:'input', seq, dx, dy}
+          const seq = msg.seq || 0;
+          if (players[id]) {
+            // apply input on server (authoritative)
+            players[id].x += msg.dx * 5;
+            players[id].y += msg.dy * 5;
+            // clamp
+            players[id].x = Math.max(0, Math.min(580, players[id].x));
+            players[id].y = Math.max(0, Math.min(580, players[id].y));
+            players[id].lastSeq = seq; // record last processed seq
+          }
+        }
+      } catch (e) {
+        console.error('Failed to parse client message', e);
       }
     }, LATENCY);
   });
@@ -67,34 +98,31 @@ wss.on('connection', (ws) => {
   });
 });
 
-// Game loop
+// Game loop (collision + broadcast)
 setInterval(() => {
-  // Collision detection
+  // collisions
   for (let id in players) {
-    let p = players[id];
-
+    const p = players[id];
     for (let i = coins.length - 1; i >= 0; i--) {
-      let c = coins[i];
-      let dx = p.x - c.x;
-      let dy = p.y - c.y;
-      let dist = Math.sqrt(dx * dx + dy * dy);
-
+      const c = coins[i];
+      const dx = p.x - c.x;
+      const dy = p.y - c.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
       if (dist < 25) {
         p.score += 1;
         coins.splice(i, 1);
-        spawnCoin(); // replace collected coin
+        spawnCoin();
       }
     }
   }
 
-  // Broadcast
+  // broadcast full state: include lastSeq for reconciliation
   const packet = {
-    type: "state",
+    type: 'state',
+    timestamp: Date.now(),
     players,
     coins,
-    timestamp: Date.now(),
   };
 
   wss.clients.forEach((client) => sendWithLag(client, packet));
-
 }, 50);
