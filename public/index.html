@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html>
+<body>
+  <h1>Krafton Game Client</h1>
+  <div id="status">Connecting...</div>
+  <script>
+    const ws = new WebSocket(`ws://${location.host}`);
+    ws.onmessage = (e) => {
+      const msg = JSON.parse(e.data);
+      console.log("Received:", msg);
+      document.getElementById('status').innerText = msg.message;
+    };
+  </script>
+</body>
+</html>
