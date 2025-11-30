@@ -1,15 +1,48 @@
 <!DOCTYPE html>
 <html>
-<body>
-  <h1>Krafton Game Client</h1>
-  <div id="status">Connecting...</div>
+<body style="background:#333; display:flex; justify-content:center;">
+  <canvas id="game" width="600" height="600"
+    style="background:#000; border:2px solid #555; margin-top:20px;"></canvas>
+
   <script>
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
     const ws = new WebSocket(`ws://${location.host}`);
+
+    let players = {};
+
     ws.onmessage = (e) => {
       const msg = JSON.parse(e.data);
-      console.log("Received:", msg);
-      document.getElementById('status').innerText = msg.message;
+      if (msg.type === 'state') {
+        players = msg.players;
+      }
     };
+
+    function sendMove(dx, dy) {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'move', dx, dy }));
+      }
+    }
+
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowUp") sendMove(0, -1);
+      if (e.key === "ArrowDown") sendMove(0, 1);
+      if (e.key === "ArrowLeft") sendMove(-1, 0);
+      if (e.key === "ArrowRight") sendMove(1, 0);
+    });
+
+    function render() {
+      ctx.clearRect(0, 0, 600, 600);
+
+      for (let id in players) {
+        const p = players[id];
+        ctx.fillStyle = p.color;
+        ctx.fillRect(p.x, p.y, 20, 20);
+      }
+
+      requestAnimationFrame(render);
+    }
+    render();
   </script>
 </body>
 </html>
