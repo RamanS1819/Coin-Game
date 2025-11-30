@@ -10,40 +10,49 @@ const server = app.listen(3000, () =>
 
 const wss = new WebSocket.Server({ server });
 
-// All connected players
+// All player data
 let players = {};
+const LATENCY = 200; // 200ms artificial lag
+
+// Delayed send wrapper
+function sendWithLag(ws, data) {
+  setTimeout(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(data));
+    }
+  }, LATENCY);
+}
 
 wss.on('connection', (ws) => {
-    const id = uuidv4();
+  const id = uuidv4();
 
-    // Initial player state
-    players[id] = { id, x: 300, y: 300, color: 'blue' };
+  players[id] = { id, x: 300, y: 300, color: 'blue' };
 
-    // Tell client their own ID
-    ws.send(JSON.stringify({ type: 'init', selfId: id }));
+  // Send init with latency
+  sendWithLag(ws, { type: 'init', selfId: id });
 
-    // When client sends movement input
-    ws.on('message', (msg) => {
-        const data = JSON.parse(msg);
+  // Incoming message (UPSTREAM lag)
+  ws.on('message', (msg) => {
+    setTimeout(() => {
+      const data = JSON.parse(msg);
 
-        if (data.type === 'move' && players[id]) {
-            players[id].x += data.dx * 5;
-            players[id].y += data.dy * 5;
-        }
-    });
+      if (data.type === 'move' && players[id]) {
+        players[id].x += data.dx * 5;
+        players[id].y += data.dy * 5;
+      }
+    }, LATENCY);
+  });
 
-    ws.on('close', () => {
-        delete players[id];
-    });
+  ws.on('close', () => {
+    delete players[id];
+  });
 });
 
-// Broadcast game state 20 times per second
+// DOWNSTREAM lag + timestamp
 setInterval(() => {
-    const packet = JSON.stringify({ type: 'state', players });
+  const packet = { type: 'state', players, timestamp: Date.now() };
 
-    wss.clients.forEach((client) => {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(packet);
-        }
-    });
+  wss.clients.forEach((client) => {
+    sendWithLag(client, packet);
+  });
 }, 50);
